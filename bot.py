@@ -4,9 +4,11 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, date
+from aiohttp import web
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, SessionPasswordNeededError, ChatForwardsRestrictedError
 from telegram import Update
 from telegram.ext import (
@@ -48,6 +50,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logging.getLogger("motor").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 # ═══════════════════════════════════════════════
 #                  LOAD ENV
@@ -55,18 +58,19 @@ logging.getLogger("motor").setLevel(logging.WARNING)
 load_dotenv()
 API_ID         = int(os.getenv("API_ID"))
 API_HASH       = os.getenv("API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 OWNER_ID       = int(os.getenv("OWNER_ID"))
 TARGET_CHANNEL = int(os.getenv("TARGET_CHANNEL"))
-PHONE_NUMBER   = os.getenv("PHONE_NUMBER")
-MONGO_URI      = os.getenv("MONGO_URI")          # mongodb+srv://...
-MONGO_DB       = os.getenv("MONGO_DB", "tgbot")  # database name
+MONGO_URI      = os.getenv("MONGO_URI")
+MONGO_DB       = os.getenv("MONGO_DB", "tgbot")
+PORT           = int(os.getenv("PORT", 8000))  # Koyeb health check port
 
 # ═══════════════════════════════════════════════
 #                  CONSTANTS
 # ═══════════════════════════════════════════════
-DAILY_LIMIT  = 150   # max videos per day
-GAP_SECONDS  = 60    # 1 minute gap between each copy/download
+DAILY_LIMIT  = 150
+GAP_SECONDS  = 60
 LINK_REGEX   = r"https://t.me/(c/)?([\w\d_]+)/(\d+)"
 
 # ═══════════════════════════════════════════════
@@ -77,46 +81,57 @@ WAIT_FIRST_LINK, WAIT_LAST_LINK = range(2)
 # ═══════════════════════════════════════════════
 #              GLOBAL STATE
 # ═══════════════════════════════════════════════
-is_running     = False   # is a task currently running?
-current_op     = None    # "copy" or "download"
-current_msg_id = None    # which message id is being processed right now
+is_running     = False
+current_op     = None
+current_msg_id = None
 
 # ═══════════════════════════════════════════════
 #                  CLIENTS
 # ═══════════════════════════════════════════════
-userbot = TelegramClient("userbot_session", API_ID, API_HASH)
+userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db           = mongo_client[MONGO_DB]
-col_task     = db["task"]      # current task document
-col_daily    = db["daily"]     # daily count tracker
+col_task     = db["task"]
+col_daily    = db["daily"]
+
+# ═══════════════════════════════════════════════
+#            HEALTH CHECK SERVER (Koyeb)
+# ═══════════════════════════════════════════════
+async def health_handler(request):
+    return web.Response(
+        text='{"status": "ok", "bot": "running"}',
+        content_type="application/json"
+    )
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"✅ Health check server started on port {PORT}")
 
 # ═══════════════════════════════════════════════
 #              MONGODB HELPERS
 # ═══════════════════════════════════════════════
-
 async def db_get_task():
-    """Return current task document or None."""
     return await col_task.find_one({"_id": "current"})
 
 async def db_save_task(data: dict):
-    await col_task.update_one(
-        {"_id": "current"},
-        {"$set": data},
-        upsert=True
-    )
+    await col_task.update_one({"_id": "current"}, {"$set": data}, upsert=True)
 
 async def db_clear_task():
     await col_task.delete_one({"_id": "current"})
     logger.info("MongoDB: task cleared")
 
 async def db_get_daily_count() -> int:
-    """Return today's processed count."""
     today = date.today().isoformat()
     doc = await col_daily.find_one({"_id": "daily"})
     if doc and doc.get("date") == today:
         return doc.get("count", 0)
-    # New day — reset
     await col_daily.update_one(
         {"_id": "daily"},
         {"$set": {"date": today, "count": 0}},
@@ -137,31 +152,20 @@ async def db_increment_daily():
 #              USERBOT LOGIN
 # ═══════════════════════════════════════════════
 async def start_userbot():
-    logger.info("UserBot connecting...")
+    logger.info("UserBot connecting via session string...")
     await userbot.connect()
     if not await userbot.is_user_authorized():
-        logger.info("Session nahi mili, phone se login ho raha hai...")
-        await userbot.send_code_request(PHONE_NUMBER)
-        code = input("📩 OTP enter karo (Telegram se aaya): ").strip()
-        try:
-            await userbot.sign_in(PHONE_NUMBER, code)
-        except SessionPasswordNeededError:
-            password = input("🔐 2FA password enter karo: ").strip()
-            await userbot.sign_in(password=password)
+        logger.error("❌ SESSION_STRING invalid ya expire ho gayi!")
+        raise SystemExit("SESSION_STRING kaam nahi kar rahi. generate_session.py se naya string lo.")
     me = await userbot.get_me()
     logger.info(f"UserBot logged in as: {me.first_name} (@{me.username}) [ID: {me.id}]")
 
-    # TARGET_CHANNEL validation
     logger.info(f"TARGET_CHANNEL validating: {TARGET_CHANNEL}")
     try:
         entity = await userbot.get_entity(TARGET_CHANNEL)
         logger.info(f"TARGET_CHANNEL OK: {entity.title} ✅")
     except Exception as e:
-        logger.error(
-            f"❌ TARGET_CHANNEL error: {e}\n"
-            f"   1. .env me TARGET_CHANNEL=-100XXXXXXXXXX format use karo\n"
-            f"   2. Userbot ko channel ka admin banao (Post Messages permission)"
-        )
+        logger.error(f"❌ TARGET_CHANNEL error: {e}")
         raise SystemExit("TARGET_CHANNEL invalid. Bot band ho raha hai.")
 
 # ═══════════════════════════════════════════════
@@ -202,16 +206,13 @@ async def process_single_message(chat_id, msg_id) -> str:
         msg = await userbot.get_messages(chat_id, ids=msg_id)
         if not msg:
             return "❌ Message not found"
-
         chat_entity = await userbot.get_entity(chat_id)
         is_restricted = getattr(chat_entity, "noforwards", False) or msg.noforwards
-
         if is_restricted:
             result = await download_and_upload(msg)
             if result == "no_media":
                 return "❌ Restricted but no media found"
             return "✅ Downloaded & uploaded (restricted)"
-
         try:
             if msg.media:
                 await userbot.send_file(TARGET_CHANNEL, msg.media, caption=None)
@@ -224,7 +225,6 @@ async def process_single_message(chat_id, msg_id) -> str:
             logger.warning(f"MSG ID {msg_id} — fallback to download")
             result = await download_and_upload(msg)
             return "✅ Downloaded & uploaded (fallback)" if result == "downloaded" else "❌ Fallback: no media"
-
     except FloodWaitError as e:
         logger.warning(f"FloodWait: {e.seconds}s")
         await asyncio.sleep(e.seconds)
@@ -241,14 +241,11 @@ async def send_busy_message(update: Update):
     if not task:
         await update.message.reply_text("⚠️ Bot busy hai lekin task info nahi mili.")
         return
-
     remaining = task["last_id"] - task["current_id"] + 1
     done      = task["current_id"] - task["first_id"]
     total     = task["last_id"] - task["first_id"] + 1
     daily_cnt = await db_get_daily_count()
-
-    op_emoji = "📋 Copy" if current_op == "copy" else "📥 Download"
-
+    op_emoji  = "📋 Copy" if current_op == "copy" else "📥 Download"
     await update.message.reply_text(
         f"🚫 *Bot abhi busy hai!*\n\n"
         f"📺 *Channel:* `{task.get('chat_title', 'Unknown')}`\n"
@@ -256,23 +253,19 @@ async def send_busy_message(update: Update):
         f"📊 *Total IDs:* `{total}`\n"
         f"✅ *Done:* `{done}` | 🔲 *Remaining:* `{remaining}`\n"
         f"⚙️ *Abhi:* {op_emoji} ho raha hai ID `{current_msg_id}`\n\n"
-        f"📅 *Aaj ka count:* `{daily_cnt}/{DAILY_LIMIT}`\n\n"
-        f"_Naya task tab de sakte ho jab remaining ≤ {NEW_TASK_THRESHOLD} ho_",
+        f"📅 *Aaj ka count:* `{daily_cnt}/{DAILY_LIMIT}`",
         parse_mode="Markdown"
     )
 
 # ═══════════════════════════════════════════════
 #           BOT COMMAND HANDLERS
 # ═══════════════════════════════════════════════
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     logger.info(f"/start by {update.effective_user.id}")
-
     task = await db_get_task()
     daily_cnt = await db_get_daily_count()
-
     task_text = ""
     if task:
         remaining = task["last_id"] - task["current_id"] + 1
@@ -285,7 +278,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📅 Aaj done: `{daily_cnt}/{DAILY_LIMIT}`\n"
             f"/resume se continue karo"
         )
-
     await update.message.reply_text(
         "👋 *Telegram Media Bot*\n\n"
         "📌 *Commands:*\n"
@@ -350,13 +342,9 @@ async def cmd_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-
-    # Block if a task is currently running
     if is_running:
         await send_busy_message(update)
         return
-
-    # Block if a task exists but is not yet complete (paused due to daily limit)
     task = await db_get_task()
     if task:
         remaining = task["last_id"] - task["current_id"] + 1
@@ -373,7 +361,6 @@ async def cmd_download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-
     logger.info(f"/download_all started by {update.effective_user.id}")
     await update.message.reply_text(
         "📥 *Download All Mode*\n\nPehle message ka link bhejo:",
@@ -406,44 +393,30 @@ async def receive_last_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat_id:
         await update.message.reply_text("❌ Invalid link, dobara bhejo:")
         return WAIT_LAST_LINK
-
     first_id       = context.user_data.get("dl_first_id")
     stored_chat_id = context.user_data.get("dl_chat_id")
-
     if chat_id != stored_chat_id:
         await update.message.reply_text("❌ Dono links same channel ke hone chahiye!")
         return ConversationHandler.END
     if last_id < first_id:
         await update.message.reply_text("❌ Last ID, First ID se chota nahi ho sakta!")
         return ConversationHandler.END
-
-    # Get channel title
     try:
         entity = await userbot.get_entity(chat_id)
         chat_title = entity.title
     except Exception:
         chat_title = str(chat_id)
-
     total = last_id - first_id + 1
     logger.info(f"Range set — {chat_title}: {first_id}→{last_id}, total: {total}")
-
-    # Save task to MongoDB
     await db_save_task({
-        "chat_id":    chat_id,
-        "chat_title": chat_title,
-        "first_id":   first_id,
-        "last_id":    last_id,
+        "chat_id": chat_id, "chat_title": chat_title,
+        "first_id": first_id, "last_id": last_id,
         "current_id": first_id,
-        "copied":     0,
-        "downloaded": 0,
-        "skipped":    0,
-        "failed":     0,
-        "status":     "running"
+        "copied": 0, "downloaded": 0, "skipped": 0, "failed": 0,
+        "status": "running"
     })
-
     daily_cnt = await db_get_daily_count()
     today_can = DAILY_LIMIT - daily_cnt
-
     progress_msg = await update.message.reply_text(
         f"🚀 *Download All Started*\n\n"
         f"📺 *Channel:* `{chat_title}`\n"
@@ -466,22 +439,19 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not task:
         await update.message.reply_text("❌ Koi saved task nahi mila.")
         return
-
     daily_cnt = await db_get_daily_count()
     if daily_cnt >= DAILY_LIMIT:
         await update.message.reply_text(
             f"📅 *Aaj ka limit ({DAILY_LIMIT}) poora ho gaya!*\n\n"
-            f"Kal automatically resume hoga.\n"
+            f"Kal /resume bhejo ya bot restart hone par auto-resume hoga.\n"
             f"/status se progress dekh sakte ho.",
             parse_mode="Markdown"
         )
         return
-
     remaining = task["last_id"] - task["current_id"] + 1
     done = task["current_id"] - task["first_id"]
     total = task["last_id"] - task["first_id"] + 1
     logger.info(f"/resume — {task['chat_title']}, from ID: {task['current_id']}, done: {done}/{total}")
-
     progress_msg = await update.message.reply_text(
         f"▶️ *Resuming Task*\n\n"
         f"📺 *Channel:* `{task['chat_title']}`\n"
@@ -502,14 +472,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ═══════════════════════════════════════════════
-#              RANGE PROCESSOR (core)
+#              RANGE PROCESSOR
 # ═══════════════════════════════════════════════
 async def process_range(update: Update, progress_msg):
     global is_running, current_op, current_msg_id
 
     task = await db_get_task()
     if not task:
-        logger.error("process_range: no task found in DB")
+        logger.error("process_range: no task in DB")
         return
 
     is_running = True
@@ -547,7 +517,7 @@ async def process_range(update: Update, progress_msg):
     for msg_id in range(start_from, last_id + 1):
         current_msg_id = msg_id
 
-        # ── Daily limit check ──
+        # Daily limit check
         daily_cnt = await db_get_daily_count()
         if daily_cnt >= DAILY_LIMIT:
             is_running = False
@@ -561,16 +531,16 @@ async def process_range(update: Update, progress_msg):
             })
             await progress_msg.edit_text(
                 f"📅 *Aaj ka limit ({DAILY_LIMIT}) poora!*\n\n"
-                f"⏸ Task paused at ID: `{msg_id}`\n"
+                f"⏸ Paused at ID: `{msg_id}`\n"
                 f"📺 Channel: `{task['chat_title']}`\n"
                 f"🔲 Remaining: `{last_id - msg_id + 1}` IDs\n\n"
                 f"📋 Copied: `{copied}` | 📥 Downloaded: `{downloaded}`\n\n"
-                f"_Kal /resume bhejo ya bot restart karne par auto-resume hoga_",
+                f"_Kal /resume bhejo_",
                 parse_mode="Markdown"
             )
             return
 
-        # ── Save progress ──
+        # Save progress
         await db_save_task({
             "current_id": msg_id,
             "copied": copied, "downloaded": downloaded,
@@ -580,23 +550,19 @@ async def process_range(update: Update, progress_msg):
 
         try:
             msg = await userbot.get_messages(chat_id, ids=msg_id)
-
             if not msg or not msg.media:
                 skipped += 1
                 logger.debug(f"MSG ID {msg_id} — skipped (no media)")
             else:
                 chat_entity = await userbot.get_entity(chat_id)
                 is_restricted = getattr(chat_entity, "noforwards", False) or msg.noforwards
-
                 if is_restricted:
                     current_op = "download"
                     logger.info(f"MSG ID {msg_id} — restricted, downloading...")
                     result = await download_and_upload(msg)
                     await db_increment_daily()
-                    if result == "downloaded":
-                        downloaded += 1
-                    else:
-                        skipped += 1
+                    downloaded += 1 if result == "downloaded" else 0
+                    skipped    += 1 if result == "no_media"   else 0
                 else:
                     try:
                         current_op = "copy"
@@ -610,10 +576,8 @@ async def process_range(update: Update, progress_msg):
                         logger.warning(f"MSG ID {msg_id} — fallback download")
                         result = await download_and_upload(msg)
                         await db_increment_daily()
-                        if result == "downloaded":
-                            downloaded += 1
-                        else:
-                            skipped += 1
+                        downloaded += 1 if result == "downloaded" else 0
+                        skipped    += 1 if result == "no_media"   else 0
 
         except FloodWaitError as e:
             logger.warning(f"FloodWait at MSG ID {msg_id} — {e.seconds}s")
@@ -621,7 +585,6 @@ async def process_range(update: Update, progress_msg):
                 f"⏳ FloodWait: `{e.seconds}s` wait...", parse_mode="Markdown"
             )
             await asyncio.sleep(e.seconds)
-            # retry same ID
             msg_id -= 1
             continue
 
@@ -629,7 +592,7 @@ async def process_range(update: Update, progress_msg):
             failed += 1
             logger.error(f"MSG ID {msg_id} — error: {e}", exc_info=True)
 
-        # ── Update progress message every 10 IDs ──
+        # Update progress every 10 IDs
         done_so_far = msg_id - first_id + 1
         if done_so_far % 10 == 0:
             daily_cnt = await db_get_daily_count()
@@ -641,19 +604,17 @@ async def process_range(update: Update, progress_msg):
             except Exception:
                 pass
 
-    # ── All done ──
+    # Complete
     elapsed = (datetime.now() - start_time).seconds
     elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
     await db_clear_task()
     is_running = False
     current_op = None
     current_msg_id = None
-
     logger.info(
         f"process_range COMPLETE — copied: {copied}, downloaded: {downloaded}, "
         f"skipped: {skipped}, failed: {failed}, time: {elapsed_str}"
     )
-
     await progress_msg.edit_text(
         f"🎉 *Task Complete!*\n\n"
         f"📺 *Channel:* `{task['chat_title']}`\n"
@@ -676,15 +637,19 @@ def main():
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # Start userbot login
     loop.run_until_complete(start_userbot())
 
+    # Start health check server
+    loop.run_until_complete(start_health_server())
+
+    # Setup bot
     app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("download", cmd_download))
-    app.add_handler(CommandHandler("resume",  cmd_resume))
-
+    app.add_handler(CommandHandler("start",        start))
+    app.add_handler(CommandHandler("status",       cmd_status))
+    app.add_handler(CommandHandler("download",     cmd_download))
+    app.add_handler(CommandHandler("resume",       cmd_resume))
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("download_all", cmd_download_all)],
         states={
