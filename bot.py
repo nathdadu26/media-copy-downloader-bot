@@ -86,6 +86,36 @@ current_op     = None
 current_msg_id = None
 
 # ═══════════════════════════════════════════════
+#         SAFE TELEGRAM SEND/EDIT HELPERS
+# ═══════════════════════════════════════════════
+async def safe_edit(msg, text, retries=3, parse_mode="Markdown"):
+    """Edit message with retry on network error."""
+    for attempt in range(retries):
+        try:
+            await msg.edit_text(text, parse_mode=parse_mode)
+            return
+        except Exception as e:
+            err = str(e)
+            if "Message is not modified" in err:
+                return  # same text, ignore silently
+            logger.warning(f"safe_edit attempt {attempt+1}/{retries} failed: {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(3)
+    logger.error("safe_edit: all retries failed, giving up")
+
+async def safe_send(update, text, retries=3, parse_mode="Markdown"):
+    """Send message with retry on network error."""
+    for attempt in range(retries):
+        try:
+            await update.message.reply_text(text, parse_mode=parse_mode)
+            return
+        except Exception as e:
+            logger.warning(f"safe_send attempt {attempt+1}/{retries} failed: {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(3)
+    logger.error("safe_send: all retries failed, giving up")
+
+# ═══════════════════════════════════════════════
 #                  CLIENTS
 # ═══════════════════════════════════════════════
 userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -529,7 +559,7 @@ async def process_range(update: Update, progress_msg):
                 "skipped": skipped, "failed": failed,
                 "status": "paused"
             })
-            await progress_msg.edit_text(
+            await safe_edit(progress_msg, 
                 f"📅 *Aaj ka limit ({DAILY_LIMIT}) poora!*\n\n"
                 f"⏸ Paused at ID: `{msg_id}`\n"
                 f"📺 Channel: `{task['chat_title']}`\n"
@@ -581,9 +611,7 @@ async def process_range(update: Update, progress_msg):
 
         except FloodWaitError as e:
             logger.warning(f"FloodWait at MSG ID {msg_id} — {e.seconds}s")
-            await update.message.reply_text(
-                f"⏳ FloodWait: `{e.seconds}s` wait...", parse_mode="Markdown"
-            )
+            await safe_send(update, f"⏳ FloodWait: `{e.seconds}s` wait...")
             await asyncio.sleep(e.seconds)
             msg_id -= 1
             continue
@@ -597,7 +625,7 @@ async def process_range(update: Update, progress_msg):
         if done_so_far % 10 == 0:
             daily_cnt = await db_get_daily_count()
             try:
-                await progress_msg.edit_text(
+                await safe_edit(progress_msg, 
                     build_progress_text(msg_id + 1, daily_cnt),
                     parse_mode="Markdown"
                 )
@@ -615,7 +643,7 @@ async def process_range(update: Update, progress_msg):
         f"process_range COMPLETE — copied: {copied}, downloaded: {downloaded}, "
         f"skipped: {skipped}, failed: {failed}, time: {elapsed_str}"
     )
-    await progress_msg.edit_text(
+    await safe_edit(progress_msg, 
         f"🎉 *Task Complete!*\n\n"
         f"📺 *Channel:* `{task['chat_title']}`\n"
         f"📊 *Total checked:* `{total}`\n\n"
@@ -626,6 +654,24 @@ async def process_range(update: Update, progress_msg):
         f"⏱ Time: `{elapsed_str}`",
         parse_mode="Markdown"
     )
+
+# ═══════════════════════════════════════════════
+#              GLOBAL ERROR HANDLER
+# ═══════════════════════════════════════════════
+async def error_handler(update, context):
+    err = context.error
+    logger.error(f"Global error: {err}", exc_info=context.error)
+    # Network errors are transient, just log them
+    from telegram.error import NetworkError, TimedOut
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning(f"Transient network error (ignored): {err}")
+        return
+    # For other errors, try to notify owner
+    try:
+        if update and update.message:
+            await safe_send(update, f"⚠️ Unexpected error: {err}")
+    except Exception:
+        pass
 
 # ═══════════════════════════════════════════════
 #                    MAIN
@@ -660,6 +706,7 @@ def main():
     )
     app.add_handler(conv_handler)
 
+    app.add_error_handler(error_handler)
     logger.info("✅ Bot polling started")
     app.run_polling()
 
