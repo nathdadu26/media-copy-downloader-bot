@@ -97,8 +97,6 @@ def is_video_or_document(msg) -> bool:
     False → Image, GIF, Audio,
             Sticker, ya kuch aur → Skip karo
     """
-    # Sirf MessageMediaDocument allow hai
-    # (Photos, Polls, Geo etc. yahan nahi aate)
     if not msg.media or not isinstance(msg.media, MessageMediaDocument):
         return False
 
@@ -456,10 +454,10 @@ async def process_range(update: Update, progress_msg):
                     logger.info(f"MSG ID {msg_id} — skipped (restricted channel)")
                 else:
                     try:
-                        # Caption same rahti hai, "Forwarded from" tag nahi lagta
-                        await userbot.send_message(TARGET_CHANNEL, msg)
+                        # ✅ Caption hatakar sirf media bhejo
+                        await userbot.send_file(TARGET_CHANNEL, msg.media, caption=None)
                         copied += 1
-                        logger.info(f"MSG ID {msg_id} — copied ✅")
+                        logger.info(f"MSG ID {msg_id} — copied (no caption) ✅")
                         await asyncio.sleep(GAP_SECONDS)
                     except ChatForwardsRestrictedError:
                         skipped += 1
