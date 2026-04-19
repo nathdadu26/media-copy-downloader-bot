@@ -3,13 +3,18 @@ import re
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, date
+from datetime import datetime
 from aiohttp import web
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, SessionPasswordNeededError, ChatForwardsRestrictedError
+from telethon.errors import FloodWaitError, ChatForwardsRestrictedError
+from telethon.tl.types import (
+    MessageMediaDocument,
+    DocumentAttributeVideo,
+    DocumentAttributeAnimated
+)
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -64,14 +69,13 @@ OWNER_ID       = int(os.getenv("OWNER_ID"))
 TARGET_CHANNEL = int(os.getenv("TARGET_CHANNEL"))
 MONGO_URI      = os.getenv("MONGO_URI")
 MONGO_DB       = os.getenv("MONGO_DB", "tgbot")
-PORT           = int(os.getenv("PORT", 8000))  # Koyeb health check port
+PORT           = int(os.getenv("PORT", 8000))
 
 # ═══════════════════════════════════════════════
 #                  CONSTANTS
 # ═══════════════════════════════════════════════
-DAILY_LIMIT  = 150
-GAP_SECONDS  = 60
-LINK_REGEX   = r"https://t.me/(c/)?([\w\d_]+)/(\d+)"
+GAP_SECONDS = 60
+LINK_REGEX  = r"https://t.me/(c/)?([\w\d_]+)/(\d+)"
 
 # ═══════════════════════════════════════════════
 #              CONVERSATION STATES
@@ -82,29 +86,58 @@ WAIT_FIRST_LINK, WAIT_LAST_LINK = range(2)
 #              GLOBAL STATE
 # ═══════════════════════════════════════════════
 is_running     = False
-current_op     = None
 current_msg_id = None
+
+# ═══════════════════════════════════════════════
+#         MEDIA TYPE FILTER
+# ═══════════════════════════════════════════════
+def is_video_or_document(msg) -> bool:
+    """
+    True  → Video ya Document   → Process karo
+    False → Image, GIF, Audio,
+            Sticker, ya kuch aur → Skip karo
+    """
+    # Sirf MessageMediaDocument allow hai
+    # (Photos, Polls, Geo etc. yahan nahi aate)
+    if not msg.media or not isinstance(msg.media, MessageMediaDocument):
+        return False
+
+    doc   = msg.media.document
+    attrs = doc.attributes
+
+    # Animated GIF → skip
+    if any(isinstance(a, DocumentAttributeAnimated) for a in attrs):
+        return False
+
+    # Video → process
+    if any(isinstance(a, DocumentAttributeVideo) for a in attrs):
+        return True
+
+    # Document (application/*, text/*, etc.) → process
+    mime = doc.mime_type or ""
+    if mime.startswith("application/") or mime.startswith("text/"):
+        return True
+
+    # Baaki sab (audio/*, image/*, sticker etc.) → skip
+    return False
 
 # ═══════════════════════════════════════════════
 #         SAFE TELEGRAM SEND/EDIT HELPERS
 # ═══════════════════════════════════════════════
 async def safe_edit(msg, text, retries=3, parse_mode="Markdown"):
-    """Edit message with retry on network error."""
     for attempt in range(retries):
         try:
             await msg.edit_text(text, parse_mode=parse_mode)
             return
         except Exception as e:
-            err = str(e)
-            if "Message is not modified" in err:
-                return  # same text, ignore silently
+            if "Message is not modified" in str(e):
+                return
             logger.warning(f"safe_edit attempt {attempt+1}/{retries} failed: {e}")
             if attempt < retries - 1:
                 await asyncio.sleep(3)
     logger.error("safe_edit: all retries failed, giving up")
 
 async def safe_send(update, text, retries=3, parse_mode="Markdown"):
-    """Send message with retry on network error."""
     for attempt in range(retries):
         try:
             await update.message.reply_text(text, parse_mode=parse_mode)
@@ -123,7 +156,6 @@ userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db           = mongo_client[MONGO_DB]
 col_task     = db["task"]
-col_daily    = db["daily"]
 
 # ═══════════════════════════════════════════════
 #            HEALTH CHECK SERVER (Koyeb)
@@ -157,27 +189,6 @@ async def db_clear_task():
     await col_task.delete_one({"_id": "current"})
     logger.info("MongoDB: task cleared")
 
-async def db_get_daily_count() -> int:
-    today = date.today().isoformat()
-    doc = await col_daily.find_one({"_id": "daily"})
-    if doc and doc.get("date") == today:
-        return doc.get("count", 0)
-    await col_daily.update_one(
-        {"_id": "daily"},
-        {"$set": {"date": today, "count": 0}},
-        upsert=True
-    )
-    logger.info(f"MongoDB: new day {today}, daily count reset")
-    return 0
-
-async def db_increment_daily():
-    today = date.today().isoformat()
-    await col_daily.update_one(
-        {"_id": "daily"},
-        {"$set": {"date": today}, "$inc": {"count": 1}},
-        upsert=True
-    )
-
 # ═══════════════════════════════════════════════
 #              USERBOT LOGIN
 # ═══════════════════════════════════════════════
@@ -186,11 +197,9 @@ async def start_userbot():
     await userbot.connect()
     if not await userbot.is_user_authorized():
         logger.error("❌ SESSION_STRING invalid ya expire ho gayi!")
-        raise SystemExit("SESSION_STRING kaam nahi kar rahi. generate_session.py se naya string lo.")
+        raise SystemExit("SESSION_STRING kaam nahi kar rahi.")
     me = await userbot.get_me()
     logger.info(f"UserBot logged in as: {me.first_name} (@{me.username}) [ID: {me.id}]")
-
-    logger.info(f"TARGET_CHANNEL validating: {TARGET_CHANNEL}")
     try:
         entity = await userbot.get_entity(TARGET_CHANNEL)
         logger.info(f"TARGET_CHANNEL OK: {entity.title} ✅")
@@ -206,62 +215,10 @@ def parse_link(link: str):
     if not match:
         return None, None
     is_private = match.group(1)
-    chat = match.group(2)
-    msg_id = int(match.group(3))
-    chat_id = int("-100" + chat) if is_private else chat
+    chat       = match.group(2)
+    msg_id     = int(match.group(3))
+    chat_id    = int("-100" + chat) if is_private else chat
     return chat_id, msg_id
-
-# ═══════════════════════════════════════════════
-#         DOWNLOAD + UPLOAD HELPER
-# ═══════════════════════════════════════════════
-async def download_and_upload(msg) -> str:
-    if not msg.media:
-        logger.warning(f"MSG ID {msg.id} — media nahi mila, skip")
-        return "no_media"
-    logger.info(f"MSG ID {msg.id} — downloading...")
-    file = await msg.download_media()
-    logger.info(f"MSG ID {msg.id} — downloaded: {file} — uploading...")
-    await userbot.send_file(TARGET_CHANNEL, file, caption=None)
-    if file and os.path.exists(file):
-        os.remove(file)
-    logger.info(f"MSG ID {msg.id} — uploaded & local file deleted ✅")
-    return "downloaded"
-
-# ═══════════════════════════════════════════════
-#         SINGLE MESSAGE PROCESS (/download)
-# ═══════════════════════════════════════════════
-async def process_single_message(chat_id, msg_id) -> str:
-    logger.info(f"Single process — chat: {chat_id}, msg_id: {msg_id}")
-    try:
-        msg = await userbot.get_messages(chat_id, ids=msg_id)
-        if not msg:
-            return "❌ Message not found"
-        chat_entity = await userbot.get_entity(chat_id)
-        is_restricted = getattr(chat_entity, "noforwards", False) or msg.noforwards
-        if is_restricted:
-            result = await download_and_upload(msg)
-            if result == "no_media":
-                return "❌ Restricted but no media found"
-            return "✅ Downloaded & uploaded (restricted)"
-        try:
-            if msg.media:
-                await userbot.send_file(TARGET_CHANNEL, msg.media, caption=None)
-                logger.info(f"MSG ID {msg_id} — copied via reference ✅")
-            else:
-                await userbot.send_message(TARGET_CHANNEL, msg.text or "")
-            await asyncio.sleep(GAP_SECONDS)
-            return "✅ Copied via reference"
-        except ChatForwardsRestrictedError:
-            logger.warning(f"MSG ID {msg_id} — fallback to download")
-            result = await download_and_upload(msg)
-            return "✅ Downloaded & uploaded (fallback)" if result == "downloaded" else "❌ Fallback: no media"
-    except FloodWaitError as e:
-        logger.warning(f"FloodWait: {e.seconds}s")
-        await asyncio.sleep(e.seconds)
-        return f"⏳ FloodWait {e.seconds}s, retry karo"
-    except Exception as e:
-        logger.error(f"MSG ID {msg_id} — error: {e}", exc_info=True)
-        return f"❌ Error: {e}"
 
 # ═══════════════════════════════════════════════
 #              BUSY STATUS MESSAGE
@@ -274,16 +231,13 @@ async def send_busy_message(update: Update):
     remaining = task["last_id"] - task["current_id"] + 1
     done      = task["current_id"] - task["first_id"]
     total     = task["last_id"] - task["first_id"] + 1
-    daily_cnt = await db_get_daily_count()
-    op_emoji  = "📋 Copy" if current_op == "copy" else "📥 Download"
     await update.message.reply_text(
         f"🚫 *Bot abhi busy hai!*\n\n"
         f"📺 *Channel:* `{task.get('chat_title', 'Unknown')}`\n"
         f"🆔 *Channel ID:* `{task.get('chat_id')}`\n"
         f"📊 *Total IDs:* `{total}`\n"
         f"✅ *Done:* `{done}` | 🔲 *Remaining:* `{remaining}`\n"
-        f"⚙️ *Abhi:* {op_emoji} ho raha hai ID `{current_msg_id}`\n\n"
-        f"📅 *Aaj ka count:* `{daily_cnt}/{DAILY_LIMIT}`",
+        f"⚙️ *Abhi:* ID `{current_msg_id}` copy ho raha hai",
         parse_mode="Markdown"
     )
 
@@ -295,28 +249,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     logger.info(f"/start by {update.effective_user.id}")
     task = await db_get_task()
-    daily_cnt = await db_get_daily_count()
     task_text = ""
     if task:
         remaining = task["last_id"] - task["current_id"] + 1
-        done = task["current_id"] - task["first_id"]
-        total = task["last_id"] - task["first_id"] + 1
+        done      = task["current_id"] - task["first_id"]
+        total     = task["last_id"] - task["first_id"] + 1
         task_text = (
             f"\n\n📌 *Active Task:*\n"
             f"📺 Channel: `{task.get('chat_title', 'Unknown')}`\n"
             f"🔲 Remaining: `{remaining}/{total}`\n"
-            f"📅 Aaj done: `{daily_cnt}/{DAILY_LIMIT}`\n"
-            f"/resume se continue karo"
+            f"✅ Done: `{done}/{total}`"
         )
     await update.message.reply_text(
         "👋 *Telegram Media Bot*\n\n"
         "📌 *Commands:*\n"
-        "/download `<link>` — Single message\n"
-        "/download\\_all — Range copy/download\n"
+        "/copy\\_all — Range copy karo\n"
         "/status — Current task status\n"
-        "/resume — Ruka hua task resume karo\n"
         "/cancel — Conversation cancel karo\n\n"
-        f"⚙️ Daily limit: `{DAILY_LIMIT}` | Gap: `{GAP_SECONDS}s`" + task_text,
+        f"⚙️ Gap: `{GAP_SECONDS}s`" + task_text,
         parse_mode="Markdown"
     )
 
@@ -327,12 +277,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not task:
         await update.message.reply_text("✅ Koi active task nahi hai.")
         return
-    daily_cnt = await db_get_daily_count()
     remaining = task["last_id"] - task["current_id"] + 1
-    done = task["current_id"] - task["first_id"]
-    total = task["last_id"] - task["first_id"] + 1
-    percent = (done / total * 100) if total > 0 else 0
-    bar = "█" * int(percent / 5) + "░" * (20 - int(percent / 5))
+    done      = task["current_id"] - task["first_id"]
+    total     = task["last_id"] - task["first_id"] + 1
+    percent   = (done / total * 100) if total > 0 else 0
+    bar       = "█" * int(percent / 5) + "░" * (20 - int(percent / 5))
     status_icon = "🟢 Running" if is_running else "⏸ Paused"
     await update.message.reply_text(
         f"📊 *Task Status*\n\n"
@@ -342,34 +291,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📌 *Range:* `{task['first_id']}` → `{task['last_id']}`\n"
         f"✅ *Done:* `{done}/{total}`\n"
         f"🔲 *Remaining:* `{remaining}`\n\n"
-        f"📋 Copied: `{task['copied']}` | 📥 Downloaded: `{task['downloaded']}`\n"
-        f"⏭ Skipped: `{task['skipped']}` | ❌ Failed: `{task['failed']}`\n\n"
-        f"📅 *Aaj done:* `{daily_cnt}/{DAILY_LIMIT}`\n"
+        f"📋 Copied: `{task['copied']}` | ⏭ Skipped: `{task['skipped']}` | ❌ Failed: `{task['failed']}`\n\n"
         f"⚙️ *Status:* {status_icon}",
         parse_mode="Markdown"
     )
 
-async def cmd_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    if is_running:
-        await send_busy_message(update)
-        return
-    if not context.args:
-        await update.message.reply_text("❌ Link do:\n`/download https://t.me/c/xxx/123`", parse_mode="Markdown")
-        return
-    link = context.args[0].strip()
-    chat_id, msg_id = parse_link(link)
-    if not chat_id:
-        await update.message.reply_text("❌ Invalid link")
-        return
-    logger.info(f"/download — link: {link}")
-    await update.message.reply_text("⏳ Processing...")
-    result = await process_single_message(chat_id, msg_id)
-    logger.info(f"/download — result: {result}")
-    await update.message.reply_text(result)
-
-async def cmd_download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_copy_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if is_running:
@@ -378,8 +305,8 @@ async def cmd_download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = await db_get_task()
     if task:
         remaining = task["last_id"] - task["current_id"] + 1
-        done = task["current_id"] - task["first_id"]
-        total = task["last_id"] - task["first_id"] + 1
+        done      = task["current_id"] - task["first_id"]
+        total     = task["last_id"] - task["first_id"] + 1
         await update.message.reply_text(
             f"⚠️ *Pichla task abhi complete nahi hua!*\n\n"
             f"📺 Channel: `{task.get('chat_title', 'Unknown')}`\n"
@@ -387,13 +314,13 @@ async def cmd_download_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 Total IDs: `{total}`\n"
             f"✅ Done: `{done}` | 🔲 Remaining: `{remaining}`\n\n"
             f"_Pehle pichla channel complete karo._\n"
-            f"/resume se continue karo | /status se status dekho",
+            f"/status se status dekho",
             parse_mode="Markdown"
         )
         return
-    logger.info(f"/download_all started by {update.effective_user.id}")
+    logger.info(f"/copy_all started by {update.effective_user.id}")
     await update.message.reply_text(
-        "📥 *Download All Mode*\n\nPehle message ka link bhejo:",
+        "📋 *Copy All Mode*\n\nPehle message ka link bhejo:",
         parse_mode="Markdown"
     )
     return WAIT_FIRST_LINK
@@ -406,7 +333,7 @@ async def receive_first_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not chat_id:
         await update.message.reply_text("❌ Invalid link, dobara bhejo:")
         return WAIT_FIRST_LINK
-    context.user_data["dl_chat_id"] = chat_id
+    context.user_data["dl_chat_id"]  = chat_id
     context.user_data["dl_first_id"] = msg_id
     logger.info(f"First link — chat: {chat_id}, msg_id: {msg_id}")
     await update.message.reply_text(
@@ -432,7 +359,7 @@ async def receive_last_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Last ID, First ID se chota nahi ho sakta!")
         return ConversationHandler.END
     try:
-        entity = await userbot.get_entity(chat_id)
+        entity     = await userbot.get_entity(chat_id)
         chat_title = entity.title
     except Exception:
         chat_title = str(chat_id)
@@ -442,57 +369,19 @@ async def receive_last_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "chat_id": chat_id, "chat_title": chat_title,
         "first_id": first_id, "last_id": last_id,
         "current_id": first_id,
-        "copied": 0, "downloaded": 0, "skipped": 0, "failed": 0,
+        "copied": 0, "skipped": 0, "failed": 0,
         "status": "running"
     })
-    daily_cnt = await db_get_daily_count()
-    today_can = DAILY_LIMIT - daily_cnt
     progress_msg = await update.message.reply_text(
-        f"🚀 *Download All Started*\n\n"
+        f"🚀 *Copy All Started*\n\n"
         f"📺 *Channel:* `{chat_title}`\n"
         f"📌 *Range:* `{first_id}` → `{last_id}`\n"
-        f"📊 *Total IDs:* `{total}`\n"
-        f"📅 *Aaj process hoga:* `{min(today_can, total)}/{DAILY_LIMIT}`\n\n"
+        f"📊 *Total IDs:* `{total}`\n\n"
         f"⏳ Shuru ho raha hai...",
         parse_mode="Markdown"
     )
     asyncio.create_task(process_range(update, progress_msg))
     return ConversationHandler.END
-
-async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    if is_running:
-        await send_busy_message(update)
-        return
-    task = await db_get_task()
-    if not task:
-        await update.message.reply_text("❌ Koi saved task nahi mila.")
-        return
-    daily_cnt = await db_get_daily_count()
-    if daily_cnt >= DAILY_LIMIT:
-        await update.message.reply_text(
-            f"📅 *Aaj ka limit ({DAILY_LIMIT}) poora ho gaya!*\n\n"
-            f"Kal /resume bhejo ya bot restart hone par auto-resume hoga.\n"
-            f"/status se progress dekh sakte ho.",
-            parse_mode="Markdown"
-        )
-        return
-    remaining = task["last_id"] - task["current_id"] + 1
-    done = task["current_id"] - task["first_id"]
-    total = task["last_id"] - task["first_id"] + 1
-    logger.info(f"/resume — {task['chat_title']}, from ID: {task['current_id']}, done: {done}/{total}")
-    progress_msg = await update.message.reply_text(
-        f"▶️ *Resuming Task*\n\n"
-        f"📺 *Channel:* `{task['chat_title']}`\n"
-        f"📌 *Range:* `{task['first_id']}` → `{task['last_id']}`\n"
-        f"⏩ *Resume from:* `{task['current_id']}`\n"
-        f"✅ *Already done:* `{done}/{total}`\n"
-        f"🔲 *Remaining:* `{remaining}`\n\n"
-        f"⏳ Processing...",
-        parse_mode="Markdown"
-    )
-    asyncio.create_task(process_range(update, progress_msg))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -505,7 +394,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #              RANGE PROCESSOR
 # ═══════════════════════════════════════════════
 async def process_range(update: Update, progress_msg):
-    global is_running, current_op, current_msg_id
+    global is_running, current_msg_id
 
     task = await db_get_task()
     if not task:
@@ -518,7 +407,6 @@ async def process_range(update: Update, progress_msg):
     last_id    = task["last_id"]
     start_from = task["current_id"]
     copied     = task["copied"]
-    downloaded = task["downloaded"]
     skipped    = task["skipped"]
     failed     = task["failed"]
     total      = last_id - first_id + 1
@@ -526,12 +414,12 @@ async def process_range(update: Update, progress_msg):
 
     logger.info(f"process_range — {task['chat_title']}: {start_from}→{last_id}")
 
-    def build_progress_text(cur_id, daily_cnt):
-        done = cur_id - first_id
+    def build_progress_text(cur_id):
+        done    = cur_id - first_id
         percent = (done / total * 100) if total > 0 else 0
-        bar = "█" * int(percent / 5) + "░" * (20 - int(percent / 5))
+        bar     = "█" * int(percent / 5) + "░" * (20 - int(percent / 5))
         elapsed = max((datetime.now() - start_time).seconds, 1)
-        eta = int((elapsed / done) * (total - done)) if done > 0 else 0
+        eta     = int((elapsed / done) * (total - done)) if done > 0 else 0
         eta_str = f"{eta // 60}m {eta % 60}s" if eta > 0 else "calculating..."
         return (
             f"📊 *Progress — {task['chat_title']}*\n\n"
@@ -539,79 +427,47 @@ async def process_range(update: Update, progress_msg):
             f"✅ Done: `{done}/{total}`\n"
             f"📌 Current ID: `{cur_id}`\n"
             f"⏱ ETA: `{eta_str}`\n\n"
-            f"📋 Copied: `{copied}` | 📥 Downloaded: `{downloaded}`\n"
-            f"⏭ Skipped: `{skipped}` | ❌ Failed: `{failed}`\n\n"
-            f"📅 Aaj: `{daily_cnt}/{DAILY_LIMIT}`"
+            f"📋 Copied: `{copied}` | ⏭ Skipped: `{skipped}` | ❌ Failed: `{failed}`"
         )
 
     for msg_id in range(start_from, last_id + 1):
         current_msg_id = msg_id
 
-        # Daily limit check
-        daily_cnt = await db_get_daily_count()
-        if daily_cnt >= DAILY_LIMIT:
-            is_running = False
-            current_op = None
-            logger.info(f"Daily limit {DAILY_LIMIT} reached at ID {msg_id}, pausing")
-            await db_save_task({
-                "current_id": msg_id,
-                "copied": copied, "downloaded": downloaded,
-                "skipped": skipped, "failed": failed,
-                "status": "paused"
-            })
-            await safe_edit(progress_msg, 
-                f"📅 *Aaj ka limit ({DAILY_LIMIT}) poora!*\n\n"
-                f"⏸ Paused at ID: `{msg_id}`\n"
-                f"📺 Channel: `{task['chat_title']}`\n"
-                f"🔲 Remaining: `{last_id - msg_id + 1}` IDs\n\n"
-                f"📋 Copied: `{copied}` | 📥 Downloaded: `{downloaded}`\n\n"
-                f"_Kal /resume bhejo_",
-                parse_mode="Markdown"
-            )
-            return
-
-        # Save progress
         await db_save_task({
             "current_id": msg_id,
-            "copied": copied, "downloaded": downloaded,
-            "skipped": skipped, "failed": failed,
+            "copied": copied, "skipped": skipped, "failed": failed,
             "status": "running"
         })
 
         try:
             msg = await userbot.get_messages(chat_id, ids=msg_id)
-            if not msg or not msg.media:
+
+            # ── Media type filter ──────────────────────────
+            if not msg or not is_video_or_document(msg):
                 skipped += 1
-                logger.debug(f"MSG ID {msg_id} — skipped (no media)")
+                logger.debug(f"MSG ID {msg_id} — skipped (not video/document)")
+            # ── Restricted channel check ───────────────────
             else:
-                chat_entity = await userbot.get_entity(chat_id)
+                chat_entity   = await userbot.get_entity(chat_id)
                 is_restricted = getattr(chat_entity, "noforwards", False) or msg.noforwards
+
                 if is_restricted:
-                    current_op = "download"
-                    logger.info(f"MSG ID {msg_id} — restricted, downloading...")
-                    result = await download_and_upload(msg)
-                    await db_increment_daily()
-                    downloaded += 1 if result == "downloaded" else 0
-                    skipped    += 1 if result == "no_media"   else 0
+                    skipped += 1
+                    logger.info(f"MSG ID {msg_id} — skipped (restricted channel)")
                 else:
                     try:
-                        current_op = "copy"
-                        await userbot.send_file(TARGET_CHANNEL, msg.media, caption=None)
-                        await db_increment_daily()
+                        # Caption same rahti hai, "Forwarded from" tag nahi lagta
+                        await userbot.send_message(TARGET_CHANNEL, msg)
                         copied += 1
-                        logger.info(f"MSG ID {msg_id} — copied via reference ✅")
+                        logger.info(f"MSG ID {msg_id} — copied ✅")
                         await asyncio.sleep(GAP_SECONDS)
                     except ChatForwardsRestrictedError:
-                        current_op = "download"
-                        logger.warning(f"MSG ID {msg_id} — fallback download")
-                        result = await download_and_upload(msg)
-                        await db_increment_daily()
-                        downloaded += 1 if result == "downloaded" else 0
-                        skipped    += 1 if result == "no_media"   else 0
+                        skipped += 1
+                        logger.warning(f"MSG ID {msg_id} — skipped (forwards restricted)")
 
         except FloodWaitError as e:
             logger.warning(f"FloodWait at MSG ID {msg_id} — {e.seconds}s")
-            await safe_send(update, f"⏳ FloodWait: `{e.seconds}s` wait...")
+            await safe_send(update, f"⏳ FloodWait: `{e.seconds}s` wait ho raha hai...")
             await asyncio.sleep(e.seconds)
             msg_id -= 1
             continue
@@ -621,38 +477,30 @@ async def process_range(update: Update, progress_msg):
             logger.error(f"MSG ID {msg_id} — error: {e}", exc_info=True)
 
         # Update progress every 10 IDs
-        done_so_far = msg_id - first_id + 1
-        if done_so_far % 10 == 0:
-            daily_cnt = await db_get_daily_count()
+        if (msg_id - first_id + 1) % 10 == 0:
             try:
-                await safe_edit(progress_msg, 
-                    build_progress_text(msg_id + 1, daily_cnt),
-                    parse_mode="Markdown"
-                )
+                await safe_edit(progress_msg, build_progress_text(msg_id + 1))
             except Exception:
                 pass
 
     # Complete
-    elapsed = (datetime.now() - start_time).seconds
+    elapsed     = (datetime.now() - start_time).seconds
     elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
     await db_clear_task()
-    is_running = False
-    current_op = None
+    is_running     = False
     current_msg_id = None
     logger.info(
-        f"process_range COMPLETE — copied: {copied}, downloaded: {downloaded}, "
+        f"process_range COMPLETE — copied: {copied}, "
         f"skipped: {skipped}, failed: {failed}, time: {elapsed_str}"
     )
-    await safe_edit(progress_msg, 
+    await safe_edit(progress_msg,
         f"🎉 *Task Complete!*\n\n"
         f"📺 *Channel:* `{task['chat_title']}`\n"
         f"📊 *Total checked:* `{total}`\n\n"
         f"📋 Copied: `{copied}`\n"
-        f"📥 Downloaded: `{downloaded}`\n"
         f"⏭ Skipped: `{skipped}`\n"
         f"❌ Failed: `{failed}`\n"
-        f"⏱ Time: `{elapsed_str}`",
-        parse_mode="Markdown"
+        f"⏱ Time: `{elapsed_str}`"
     )
 
 # ═══════════════════════════════════════════════
@@ -661,12 +509,10 @@ async def process_range(update: Update, progress_msg):
 async def error_handler(update, context):
     err = context.error
     logger.error(f"Global error: {err}", exc_info=context.error)
-    # Network errors are transient, just log them
     from telegram.error import NetworkError, TimedOut
     if isinstance(err, (NetworkError, TimedOut)):
         logger.warning(f"Transient network error (ignored): {err}")
         return
-    # For other errors, try to notify owner
     try:
         if update and update.message:
             await safe_send(update, f"⚠️ Unexpected error: {err}")
@@ -684,29 +530,26 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Start userbot login
     loop.run_until_complete(start_userbot())
-
-    # Start health check server
     loop.run_until_complete(start_health_server())
 
-    # Setup bot
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",        start))
-    app.add_handler(CommandHandler("status",       cmd_status))
-    app.add_handler(CommandHandler("download",     cmd_download))
-    app.add_handler(CommandHandler("resume",       cmd_resume))
+    app.add_handler(CommandHandler("start",  start))
+    app.add_handler(CommandHandler("status", cmd_status))
+
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("download_all", cmd_download_all)],
+        entry_points=[CommandHandler("copy_all", cmd_copy_all)],
         states={
             WAIT_FIRST_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_first_link)],
             WAIT_LAST_LINK:  [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_last_link)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
     app.add_handler(conv_handler)
-
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_error_handler(error_handler)
+
     logger.info("✅ Bot polling started")
     app.run_polling()
 
