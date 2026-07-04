@@ -77,9 +77,6 @@ LINK_REGEX  = r"https://t.me/(c/)?([\w\d_]+)/(\d+)"
 MIN_FILE_SIZE_MB    = float(os.getenv("MIN_FILE_SIZE_MB", 10))
 MIN_FILE_SIZE_BYTES = int(MIN_FILE_SIZE_MB * 1024 * 1024)
 
-# Telegram caption limit hai 1024 characters, isse bada bhejne par error aata hai
-MAX_CAPTION_LEN = 1024
-
 # ═══════════════════════════════════════════════
 #              CONVERSATION STATES
 # ═══════════════════════════════════════════════
@@ -117,17 +114,22 @@ def is_size_ok(msg) -> bool:
     return size > MIN_FILE_SIZE_BYTES
 
 # ═══════════════════════════════════════════════
-#         CAPTION HELPER
+#         MARKDOWN ESCAPE HELPER
 # ═══════════════════════════════════════════════
-def build_caption(msg) -> str:
+def escape_md(text) -> str:
     """
-    Original message ka text/caption nikaalta hai.
-    Telegram ki 1024-char caption limit se bada ho to safely trim karta hai.
+    Legacy Markdown (parse_mode='Markdown') sirf kuch characters ko
+    special maanta hai: _ * ` [
+    Agar chat_title ya koi bhi dynamic text (jo Telegram se aata hai)
+    inme se koi character rakhta hai to parser crash ho jata hai
+    ("Can't parse entities"). Isliye bhejne se pehle unhe escape karo.
     """
-    caption = msg.text or ""
-    if len(caption) > MAX_CAPTION_LEN:
-        caption = caption[: MAX_CAPTION_LEN - 3] + "..."
-    return caption
+    if not text:
+        return text
+    text = str(text)
+    for ch in ("\\", "_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
 
 # ═══════════════════════════════════════════════
 #         SAFE TELEGRAM SEND/EDIT HELPERS
@@ -241,7 +243,7 @@ async def send_busy_message(update: Update):
     total     = task["last_id"] - task["first_id"] + 1
     await update.message.reply_text(
         f"🚫 *Bot abhi busy hai!*\n\n"
-        f"📺 *Channel:* `{task.get('chat_title', 'Unknown')}`\n"
+        f"📺 *Channel:* `{escape_md(task.get('chat_title', 'Unknown'))}`\n"
         f"🆔 *Channel ID:* `{task.get('chat_id')}`\n"
         f"📊 *Total IDs:* `{total}`\n"
         f"✅ *Done:* `{done}` | 🔲 *Remaining:* `{remaining}`\n"
@@ -265,7 +267,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total     = task["last_id"] - task["first_id"] + 1
         task_text = (
             f"\n\n📌 *Active Task:*\n"
-            f"📺 Channel: `{task.get('chat_title', 'Unknown')}`\n"
+            f"📺 Channel: `{escape_md(task.get('chat_title', 'Unknown'))}`\n"
             f"🔲 Remaining: `{remaining}/{total}`\n"
             f"✅ Done: `{done}/{total}`"
         )
@@ -295,7 +297,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 *Task Status*\n\n"
         f"`{bar}` {percent:.1f}%\n\n"
-        f"📺 *Channel:* `{task.get('chat_title', 'Unknown')}`\n"
+        f"📺 *Channel:* `{escape_md(task.get('chat_title', 'Unknown'))}`\n"
         f"🆔 *Channel ID:* `{task.get('chat_id')}`\n"
         f"📌 *Range:* `{task['first_id']}` → `{task['last_id']}`\n"
         f"✅ *Done:* `{done}/{total}`\n"
@@ -318,7 +320,7 @@ async def cmd_copy_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total     = task["last_id"] - task["first_id"] + 1
         await update.message.reply_text(
             f"⚠️ *Pichla task abhi complete nahi hua!*\n\n"
-            f"📺 Channel: `{task.get('chat_title', 'Unknown')}`\n"
+            f"📺 Channel: `{escape_md(task.get('chat_title', 'Unknown'))}`\n"
             f"🆔 Channel ID: `{task.get('chat_id')}`\n"
             f"📊 Total IDs: `{total}`\n"
             f"✅ Done: `{done}` | 🔲 Remaining: `{remaining}`\n\n"
@@ -384,7 +386,7 @@ async def receive_last_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
     progress_msg = await update.message.reply_text(
         f"🚀 *Copy All Started*\n\n"
-        f"📺 *Channel:* `{chat_title}`\n"
+        f"📺 *Channel:* `{escape_md(chat_title)}`\n"
         f"📌 *Range:* `{first_id}` → `{last_id}`\n"
         f"📊 *Total IDs:* `{total}`\n"
         f"📦 *Min Size:* `{MIN_FILE_SIZE_MB}MB`\n\n"
@@ -432,7 +434,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         copy_task      = None
         await update.message.reply_text(
             f"🛑 *Purana/stale task DB se clear kar diya gaya.*\n\n"
-            f"📺 Channel: `{stale_task.get('chat_title', 'Unknown')}`\n"
+            f"📺 Channel: `{escape_md(stale_task.get('chat_title', 'Unknown'))}`\n"
             f"✅ Ab naya /copy_all shuru kar sakte ho.",
             parse_mode="Markdown"
         )
@@ -476,7 +478,7 @@ async def process_range(update: Update, progress_msg):
         eta     = int((elapsed / done) * (total - done)) if done > 0 else 0
         eta_str = f"{eta // 60}m {eta % 60}s" if eta > 0 else "calculating..."
         return (
-            f"📊 *Progress — {task['chat_title']}*\n\n"
+            f"📊 *Progress — {escape_md(task['chat_title'])}*\n\n"
             f"`{bar}` {percent:.1f}%\n\n"
             f"✅ Done: `{done}/{total}`\n"
             f"📌 Current ID: `{cur_id}`\n"
@@ -515,11 +517,10 @@ async def process_range(update: Update, progress_msg):
                         logger.info(f"MSG ID {msg_id} — skipped (restricted channel)")
                     else:
                         try:
-                            # ✅ Original caption ke saath media bhejo
-                            caption = build_caption(msg)
-                            await userbot.send_file(TARGET_CHANNEL, msg.media, caption=caption)
+                            # ✅ Original caption jaisi hai waisi hi bhejo, koi trimming/building nahi
+                            await userbot.send_file(TARGET_CHANNEL, msg.media, caption=msg.text)
                             copied += 1
-                            logger.info(f"MSG ID {msg_id} — copied (with caption) ✅")
+                            logger.info(f"MSG ID {msg_id} — copied (original caption) ✅")
                             await asyncio.sleep(GAP_SECONDS)
                         except ChatForwardsRestrictedError:
                             skipped += 1
@@ -553,7 +554,7 @@ async def process_range(update: Update, progress_msg):
         )
         await safe_edit(progress_msg,
             f"🎉 *Task Complete!*\n\n"
-            f"📺 *Channel:* `{task['chat_title']}`\n"
+            f"📺 *Channel:* `{escape_md(task['chat_title'])}`\n"
             f"📊 *Total checked:* `{total}`\n\n"
             f"📋 Copied: `{copied}`\n"
             f"⏭ Skipped: `{skipped}`\n"
@@ -567,7 +568,7 @@ async def process_range(update: Update, progress_msg):
         try:
             await safe_edit(progress_msg,
                 f"🛑 *Task Cancelled*\n\n"
-                f"📺 *Channel:* `{task['chat_title']}`\n"
+                f"📺 *Channel:* `{escape_md(task['chat_title'])}`\n"
                 f"📌 *Ruka hua ID:* `{current_msg_id}`\n\n"
                 f"📋 Copied: `{copied}` | ⏭ Skipped: `{skipped}` | ❌ Failed: `{failed}`"
             )
@@ -590,7 +591,7 @@ async def error_handler(update, context):
         return
     try:
         if update and update.message:
-            await safe_send(update, f"⚠️ Unexpected error: {err}")
+            await safe_send(update, f"⚠️ Unexpected error: {escape_md(err)}")
     except Exception:
         pass
 
