@@ -77,6 +77,9 @@ LINK_REGEX  = r"https://t.me/(c/)?([\w\d_]+)/(\d+)"
 MIN_FILE_SIZE_MB    = float(os.getenv("MIN_FILE_SIZE_MB", 10))
 MIN_FILE_SIZE_BYTES = int(MIN_FILE_SIZE_MB * 1024 * 1024)
 
+# Telegram caption limit hai 1024 characters, isse bada bhejne par error aata hai
+MAX_CAPTION_LEN = 1024
+
 # ═══════════════════════════════════════════════
 #              CONVERSATION STATES
 # ═══════════════════════════════════════════════
@@ -112,6 +115,19 @@ def is_size_ok(msg) -> bool:
         return False
 
     return size > MIN_FILE_SIZE_BYTES
+
+# ═══════════════════════════════════════════════
+#         CAPTION HELPER
+# ═══════════════════════════════════════════════
+def build_caption(msg) -> str:
+    """
+    Original message ka text/caption nikaalta hai.
+    Telegram ki 1024-char caption limit se bada ho to safely trim karta hai.
+    """
+    caption = msg.text or ""
+    if len(caption) > MAX_CAPTION_LEN:
+        caption = caption[: MAX_CAPTION_LEN - 3] + "..."
+    return caption
 
 # ═══════════════════════════════════════════════
 #         SAFE TELEGRAM SEND/EDIT HELPERS
@@ -385,7 +401,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     logger.info(f"/cancel by {update.effective_user.id}")
 
-    # Agar background copy task chal raha hai, use actually rok do
+    # Case 1: Background copy task memory mein actively chal raha hai
     if copy_task and not copy_task.done():
         copy_task.cancel()
         try:
@@ -403,10 +419,28 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🛑 *Copy process cancel kar diya gaya.*\nTask clear ho gaya, ab naya /copy_all shuru kar sakte ho.",
             parse_mode="Markdown"
         )
-    else:
-        # Sirf link-input conversation cancel ho rahi hai, koi task nahi chal raha
-        await update.message.reply_text("❌ Cancelled.")
+        context.user_data.clear()
+        return ConversationHandler.END
 
+    # Case 2: Memory mein koi task nahi (bot restart/redeploy hua tha),
+    # lekin MongoDB mein purana task abhi bhi pada hai → use bhi clear karo
+    stale_task = await db_get_task()
+    if stale_task:
+        await db_clear_task()
+        is_running     = False
+        current_msg_id = None
+        copy_task      = None
+        await update.message.reply_text(
+            f"🛑 *Purana/stale task DB se clear kar diya gaya.*\n\n"
+            f"📺 Channel: `{stale_task.get('chat_title', 'Unknown')}`\n"
+            f"✅ Ab naya /copy_all shuru kar sakte ho.",
+            parse_mode="Markdown"
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # Case 3: Koi task hi nahi hai, sirf link-input conversation cancel ho rahi hai
+    await update.message.reply_text("❌ Cancelled.")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -481,10 +515,11 @@ async def process_range(update: Update, progress_msg):
                         logger.info(f"MSG ID {msg_id} — skipped (restricted channel)")
                     else:
                         try:
-                            # ✅ Caption hatakar sirf media bhejo
-                            await userbot.send_file(TARGET_CHANNEL, msg.media, caption=None)
+                            # ✅ Original caption ke saath media bhejo
+                            caption = build_caption(msg)
+                            await userbot.send_file(TARGET_CHANNEL, msg.media, caption=caption)
                             copied += 1
-                            logger.info(f"MSG ID {msg_id} — copied (no caption) ✅")
+                            logger.info(f"MSG ID {msg_id} — copied (with caption) ✅")
                             await asyncio.sleep(GAP_SECONDS)
                         except ChatForwardsRestrictedError:
                             skipped += 1
