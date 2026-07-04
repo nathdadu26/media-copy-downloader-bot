@@ -69,7 +69,7 @@ PORT           = int(os.getenv("PORT", 8000))
 # ═══════════════════════════════════════════════
 #                  CONSTANTS
 # ═══════════════════════════════════════════════
-GAP_SECONDS = 60
+GAP_SECONDS = 10
 LINK_REGEX  = r"https://t.me/(c/)?([\w\d_]+)/(\d+)"
 
 # Sirf itne se bade files copy honge (MB mein). Railway variable se override
