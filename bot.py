@@ -10,11 +10,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, ChatForwardsRestrictedError
-from telethon.tl.types import (
-    MessageMediaDocument,
-    DocumentAttributeVideo,
-    DocumentAttributeAnimated
-)
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -77,6 +72,11 @@ PORT           = int(os.getenv("PORT", 8000))
 GAP_SECONDS = 60
 LINK_REGEX  = r"https://t.me/(c/)?([\w\d_]+)/(\d+)"
 
+# Sirf itne se bade files copy honge (MB mein). Railway variable se override
+# kar sakte ho (MIN_FILE_SIZE_MB), warna default 10 MB rahega.
+MIN_FILE_SIZE_MB    = float(os.getenv("MIN_FILE_SIZE_MB", 10))
+MIN_FILE_SIZE_BYTES = int(MIN_FILE_SIZE_MB * 1024 * 1024)
+
 # ═══════════════════════════════════════════════
 #              CONVERSATION STATES
 # ═══════════════════════════════════════════════
@@ -87,37 +87,31 @@ WAIT_FIRST_LINK, WAIT_LAST_LINK = range(2)
 # ═══════════════════════════════════════════════
 is_running     = False
 current_msg_id = None
+copy_task      = None   # holds the asyncio.Task running process_range
 
 # ═══════════════════════════════════════════════
-#         MEDIA TYPE FILTER
+#         FILE SIZE FILTER
 # ═══════════════════════════════════════════════
-def is_video_or_document(msg) -> bool:
+def is_size_ok(msg) -> bool:
     """
-    True  → Video ya Document   → Process karo
-    False → Image, GIF, Audio,
-            Sticker, ya kuch aur → Skip karo
+    True  → Koi bhi media (image, video, document, zip, gif, audio...)
+            jiska size MIN_FILE_SIZE_MB se bada ho → Process karo
+    False → Media nahi hai, ya size chota hai        → Skip karo
+
+    Type ki koi restriction nahi — sirf size check hota hai.
     """
-    if not msg.media or not isinstance(msg.media, MessageMediaDocument):
+    if not msg.media:
         return False
 
-    doc   = msg.media.document
-    attrs = doc.attributes
+    try:
+        size = msg.file.size if msg.file else None
+    except Exception:
+        size = None
 
-    # Animated GIF → skip
-    if any(isinstance(a, DocumentAttributeAnimated) for a in attrs):
+    if not size:
         return False
 
-    # Video → process
-    if any(isinstance(a, DocumentAttributeVideo) for a in attrs):
-        return True
-
-    # Document (application/*, text/*, etc.) → process
-    mime = doc.mime_type or ""
-    if mime.startswith("application/") or mime.startswith("text/"):
-        return True
-
-    # Baaki sab (audio/*, image/*, sticker etc.) → skip
-    return False
+    return size > MIN_FILE_SIZE_BYTES
 
 # ═══════════════════════════════════════════════
 #         SAFE TELEGRAM SEND/EDIT HELPERS
@@ -235,7 +229,8 @@ async def send_busy_message(update: Update):
         f"🆔 *Channel ID:* `{task.get('chat_id')}`\n"
         f"📊 *Total IDs:* `{total}`\n"
         f"✅ *Done:* `{done}` | 🔲 *Remaining:* `{remaining}`\n"
-        f"⚙️ *Abhi:* ID `{current_msg_id}` copy ho raha hai",
+        f"⚙️ *Abhi:* ID `{current_msg_id}` copy ho raha hai\n\n"
+        f"🛑 Rokne ke liye /cancel bhejo",
         parse_mode="Markdown"
     )
 
@@ -263,8 +258,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 *Commands:*\n"
         "/copy\\_all — Range copy karo\n"
         "/status — Current task status\n"
-        "/cancel — Conversation cancel karo\n\n"
-        f"⚙️ Gap: `{GAP_SECONDS}s`" + task_text,
+        "/cancel — Chal raha task ya conversation cancel karo\n\n"
+        f"⚙️ Gap: `{GAP_SECONDS}s` | Min size: `{MIN_FILE_SIZE_MB}MB`" + task_text,
         parse_mode="Markdown"
     )
 
@@ -311,7 +306,7 @@ async def cmd_copy_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 Channel ID: `{task.get('chat_id')}`\n"
             f"📊 Total IDs: `{total}`\n"
             f"✅ Done: `{done}` | 🔲 Remaining: `{remaining}`\n\n"
-            f"_Pehle pichla channel complete karo._\n"
+            f"_Pehle pichla channel complete karo ya /cancel bhejo._\n"
             f"/status se status dekho",
             parse_mode="Markdown"
         )
@@ -341,6 +336,7 @@ async def receive_first_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return WAIT_LAST_LINK
 
 async def receive_last_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global copy_task
     if update.effective_user.id != OWNER_ID:
         return ConversationHandler.END
     link = update.message.text.strip()
@@ -374,18 +370,44 @@ async def receive_last_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚀 *Copy All Started*\n\n"
         f"📺 *Channel:* `{chat_title}`\n"
         f"📌 *Range:* `{first_id}` → `{last_id}`\n"
-        f"📊 *Total IDs:* `{total}`\n\n"
-        f"⏳ Shuru ho raha hai...",
+        f"📊 *Total IDs:* `{total}`\n"
+        f"📦 *Min Size:* `{MIN_FILE_SIZE_MB}MB`\n\n"
+        f"⏳ Shuru ho raha hai...\n"
+        f"🛑 Rokne ke liye /cancel bhejo",
         parse_mode="Markdown"
     )
-    asyncio.create_task(process_range(update, progress_msg))
+    copy_task = asyncio.create_task(process_range(update, progress_msg))
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global copy_task, is_running, current_msg_id
     if update.effective_user.id != OWNER_ID:
         return ConversationHandler.END
     logger.info(f"/cancel by {update.effective_user.id}")
-    await update.message.reply_text("❌ Cancelled.")
+
+    # Agar background copy task chal raha hai, use actually rok do
+    if copy_task and not copy_task.done():
+        copy_task.cancel()
+        try:
+            await copy_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"cancel: error while awaiting cancelled task: {e}")
+
+        is_running     = False
+        current_msg_id = None
+        copy_task      = None
+        await db_clear_task()
+        await update.message.reply_text(
+            "🛑 *Copy process cancel kar diya gaya.*\nTask clear ho gaya, ab naya /copy_all shuru kar sakte ho.",
+            parse_mode="Markdown"
+        )
+    else:
+        # Sirf link-input conversation cancel ho rahi hai, koi task nahi chal raha
+        await update.message.reply_text("❌ Cancelled.")
+
+    context.user_data.clear()
     return ConversationHandler.END
 
 # ═══════════════════════════════════════════════
@@ -425,81 +447,101 @@ async def process_range(update: Update, progress_msg):
             f"✅ Done: `{done}/{total}`\n"
             f"📌 Current ID: `{cur_id}`\n"
             f"⏱ ETA: `{eta_str}`\n\n"
-            f"📋 Copied: `{copied}` | ⏭ Skipped: `{skipped}` | ❌ Failed: `{failed}`"
+            f"📋 Copied: `{copied}` | ⏭ Skipped: `{skipped}` | ❌ Failed: `{failed}`\n\n"
+            f"🛑 Rokne ke liye /cancel bhejo"
         )
 
-    for msg_id in range(start_from, last_id + 1):
-        current_msg_id = msg_id
+    try:
+        for msg_id in range(start_from, last_id + 1):
+            current_msg_id = msg_id
 
-        await db_save_task({
-            "current_id": msg_id,
-            "copied": copied, "skipped": skipped, "failed": failed,
-            "status": "running"
-        })
+            await db_save_task({
+                "current_id": msg_id,
+                "copied": copied, "skipped": skipped, "failed": failed,
+                "status": "running"
+            })
 
-        try:
-            msg = await userbot.get_messages(chat_id, ids=msg_id)
-
-            # ── Media type filter ──────────────────────────
-            if not msg or not is_video_or_document(msg):
-                skipped += 1
-                logger.debug(f"MSG ID {msg_id} — skipped (not video/document)")
-            # ── Restricted channel check ───────────────────
-            else:
-                chat_entity   = await userbot.get_entity(chat_id)
-                is_restricted = getattr(chat_entity, "noforwards", False) or msg.noforwards
-
-                if is_restricted:
-                    skipped += 1
-                    logger.info(f"MSG ID {msg_id} — skipped (restricted channel)")
-                else:
-                    try:
-                        # ✅ Caption hatakar sirf media bhejo
-                        await userbot.send_file(TARGET_CHANNEL, msg.media, caption=None)
-                        copied += 1
-                        logger.info(f"MSG ID {msg_id} — copied (no caption) ✅")
-                        await asyncio.sleep(GAP_SECONDS)
-                    except ChatForwardsRestrictedError:
-                        skipped += 1
-                        logger.warning(f"MSG ID {msg_id} — skipped (forwards restricted)")
-
-        except FloodWaitError as e:
-            logger.warning(f"FloodWait at MSG ID {msg_id} — {e.seconds}s")
-            await safe_send(update, f"⏳ FloodWait: `{e.seconds}s` wait ho raha hai...")
-            await asyncio.sleep(e.seconds)
-            msg_id -= 1
-            continue
-
-        except Exception as e:
-            failed += 1
-            logger.error(f"MSG ID {msg_id} — error: {e}", exc_info=True)
-
-        # Update progress every 10 IDs
-        if (msg_id - first_id + 1) % 10 == 0:
             try:
-                await safe_edit(progress_msg, build_progress_text(msg_id + 1))
-            except Exception:
-                pass
+                msg = await userbot.get_messages(chat_id, ids=msg_id)
 
-    # Complete
-    elapsed     = (datetime.now() - start_time).seconds
-    elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
-    await db_clear_task()
-    is_running     = False
-    current_msg_id = None
-    logger.info(
-        f"process_range COMPLETE — copied: {copied}, "
-        f"skipped: {skipped}, failed: {failed}, time: {elapsed_str}"
-    )
-    await safe_edit(progress_msg,
-        f"🎉 *Task Complete!*\n\n"
-        f"📺 *Channel:* `{task['chat_title']}`\n"
-        f"📊 *Total checked:* `{total}`\n\n"
-        f"📋 Copied: `{copied}`\n"
-        f"⏭ Skipped: `{skipped}`\n"
-        f"❌ Failed: `{failed}`\n"
-        f"⏱ Time: `{elapsed_str}`"
-    )
+                # ── File size filter ──────────────────────────
+                if not msg or not is_size_ok(msg):
+                    skipped += 1
+                    logger.debug(
+                        f"MSG ID {msg_id} — skipped "
+                        f"(no media ya size <= {MIN_FILE_SIZE_MB}MB)"
+                    )
+                # ── Restricted channel check ───────────────────
+                else:
+                    chat_entity   = await userbot.get_entity(chat_id)
+                    is_restricted = getattr(chat_entity, "noforwards", False) or msg.noforwards
+
+                    if is_restricted:
+                        skipped += 1
+                        logger.info(f"MSG ID {msg_id} — skipped (restricted channel)")
+                    else:
+                        try:
+                            # ✅ Caption hatakar sirf media bhejo
+                            await userbot.send_file(TARGET_CHANNEL, msg.media, caption=None)
+                            copied += 1
+                            logger.info(f"MSG ID {msg_id} — copied (no caption) ✅")
+                            await asyncio.sleep(GAP_SECONDS)
+                        except ChatForwardsRestrictedError:
+                            skipped += 1
+                            logger.warning(f"MSG ID {msg_id} — skipped (forwards restricted)")
+
+            except FloodWaitError as e:
+                logger.warning(f"FloodWait at MSG ID {msg_id} — {e.seconds}s")
+                await safe_send(update, f"⏳ FloodWait: `{e.seconds}s` wait ho raha hai...")
+                await asyncio.sleep(e.seconds)
+                msg_id -= 1
+                continue
+
+            except Exception as e:
+                failed += 1
+                logger.error(f"MSG ID {msg_id} — error: {e}", exc_info=True)
+
+            # Update progress every 10 IDs
+            if (msg_id - first_id + 1) % 10 == 0:
+                try:
+                    await safe_edit(progress_msg, build_progress_text(msg_id + 1))
+                except Exception:
+                    pass
+
+        # Complete
+        elapsed     = (datetime.now() - start_time).seconds
+        elapsed_str = f"{elapsed // 60}m {elapsed % 60}s"
+        await db_clear_task()
+        logger.info(
+            f"process_range COMPLETE — copied: {copied}, "
+            f"skipped: {skipped}, failed: {failed}, time: {elapsed_str}"
+        )
+        await safe_edit(progress_msg,
+            f"🎉 *Task Complete!*\n\n"
+            f"📺 *Channel:* `{task['chat_title']}`\n"
+            f"📊 *Total checked:* `{total}`\n\n"
+            f"📋 Copied: `{copied}`\n"
+            f"⏭ Skipped: `{skipped}`\n"
+            f"❌ Failed: `{failed}`\n"
+            f"⏱ Time: `{elapsed_str}`"
+        )
+
+    except asyncio.CancelledError:
+        # /cancel se yahan pahuchte hain — DB ko cancel() function khud clear karega
+        logger.info(f"process_range CANCELLED by user at MSG ID {current_msg_id}")
+        try:
+            await safe_edit(progress_msg,
+                f"🛑 *Task Cancelled*\n\n"
+                f"📺 *Channel:* `{task['chat_title']}`\n"
+                f"📌 *Ruka hua ID:* `{current_msg_id}`\n\n"
+                f"📋 Copied: `{copied}` | ⏭ Skipped: `{skipped}` | ❌ Failed: `{failed}`"
+            )
+        except Exception:
+            pass
+        raise
+
+    finally:
+        is_running = False
 
 # ═══════════════════════════════════════════════
 #              GLOBAL ERROR HANDLER
@@ -535,6 +577,10 @@ def main():
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("status", cmd_status))
 
+    # /cancel ko sabse pehle add karo (group 0) taaki ye hamesha
+    # sabse pehle check ho, chahe conversation active ho ya na ho.
+    app.add_handler(CommandHandler("cancel", cancel))
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("copy_all", cmd_copy_all)],
         states={
@@ -545,7 +591,6 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("cancel", cancel))
     app.add_error_handler(error_handler)
 
     logger.info("✅ Bot polling started")
