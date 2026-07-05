@@ -4,6 +4,7 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
+import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -66,10 +67,16 @@ MONGO_URI      = os.getenv("MONGO_URI")
 MONGO_DB       = os.getenv("MONGO_DB", "tgbot")
 PORT           = int(os.getenv("PORT", 8000))
 
+# Apne aap ko ping karne ke liye apna public health-check URL (Koyeb/Railway
+# waala public URL, jaise "https://your-app.koyeb.app/health"). Agar set
+# nahi kiya to self-ping automatically disable rahega.
+SELF_PING_URL      = os.getenv("SELF_PING_URL", "").strip()
+SELF_PING_INTERVAL = int(os.getenv("SELF_PING_INTERVAL", 20 * 60))  # seconds, default 20 min
+
 # ═══════════════════════════════════════════════
 #                  CONSTANTS
 # ═══════════════════════════════════════════════
-GAP_SECONDS = 10
+GAP_SECONDS = 60
 LINK_REGEX  = r"https://t.me/(c/)?([\w\d_]+)/(\d+)"
 
 # Sirf itne se bade files copy honge (MB mein). Railway variable se override
@@ -88,6 +95,7 @@ WAIT_FIRST_LINK, WAIT_LAST_LINK = range(2)
 is_running     = False
 current_msg_id = None
 copy_task      = None   # holds the asyncio.Task running process_range
+ping_task      = None   # holds the asyncio.Task running self_ping_loop
 
 # ═══════════════════════════════════════════════
 #         FILE SIZE FILTER
@@ -158,6 +166,22 @@ async def safe_send(update, text, retries=3, parse_mode="Markdown"):
                 await asyncio.sleep(3)
     logger.error("safe_send: all retries failed, giving up")
 
+async def notify(bot, chat_id, text, retries=3, parse_mode="Markdown"):
+    """
+    safe_send jaisa hi hai, lekin kisi command 'update' object ke bina
+    kaam karta hai — sirf bot + chat_id chahiye. Startup par auto-resume
+    jaise cases mein use hota hai jahan koi live update maujood nahi hota.
+    """
+    for attempt in range(retries):
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+        except Exception as e:
+            logger.warning(f"notify attempt {attempt+1}/{retries} failed: {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(3)
+    logger.error("notify: all retries failed, giving up")
+    return None
+
 # ═══════════════════════════════════════════════
 #                  CLIENTS
 # ═══════════════════════════════════════════════
@@ -185,6 +209,37 @@ async def start_health_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     logger.info(f"✅ Health check server started on port {PORT}")
+
+# ═══════════════════════════════════════════════
+#         AUTO SELF-PING (instance ko sleep se bachane ke liye)
+# ═══════════════════════════════════════════════
+async def self_ping_loop():
+    """
+    Har SELF_PING_INTERVAL seconds (default 20 min) mein apne khud ke
+    health-check URL ko HTTP GET request bhejta hai. Kai hosting platforms
+    (Koyeb/Render/Railway free tier) service ko "idle" samajh kar sula
+    dete hain agar koi real external traffic na aaye — ye periodic ping
+    us traffic ka kaam karta hai aur instance ko jaga rakhta hai.
+
+    SELF_PING_URL env variable mein apna public health-check URL daalo,
+    jaise: https://your-app-name.koyeb.app/health
+    Agar ye set nahi hai to self-ping automatically skip ho jayega.
+    """
+    if not SELF_PING_URL:
+        logger.info("ℹ️ SELF_PING_URL set nahi hai — self-ping disabled.")
+        return
+
+    logger.info(f"🔁 Self-ping enabled — har {SELF_PING_INTERVAL}s mein {SELF_PING_URL} ping hoga")
+    async with aiohttp.ClientSession() as session:
+        while True:
+            await asyncio.sleep(SELF_PING_INTERVAL)
+            try:
+                async with session.get(
+                    SELF_PING_URL, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    logger.info(f"🔁 Self-ping OK — status {resp.status}")
+            except Exception as e:
+                logger.warning(f"🔁 Self-ping failed: {e}")
 
 # ═══════════════════════════════════════════════
 #              MONGODB HELPERS
@@ -394,7 +449,7 @@ async def receive_last_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🛑 Rokne ke liye /cancel bhejo",
         parse_mode="Markdown"
     )
-    copy_task = asyncio.create_task(process_range(update, progress_msg))
+    copy_task = asyncio.create_task(process_range(progress_msg))
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -418,7 +473,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         copy_task      = None
         await db_clear_task()
         await update.message.reply_text(
-            "🛑 *Copy process cancel kar diya gaya.*\nTask clear ho gaya, ab naya /copy_all shuru kar sakte ho.",
+            "🛑 *Copy process cancel kar diya gaya.*\nTask clear ho gaya, ab naya /copy\\_all shuru kar sakte ho.",
             parse_mode="Markdown"
         )
         context.user_data.clear()
@@ -435,7 +490,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🛑 *Purana/stale task DB se clear kar diya gaya.*\n\n"
             f"📺 Channel: `{escape_md(stale_task.get('chat_title', 'Unknown'))}`\n"
-            f"✅ Ab naya /copy_all shuru kar sakte ho.",
+            f"✅ Ab naya /copy\\_all shuru kar sakte ho.",
             parse_mode="Markdown"
         )
         context.user_data.clear()
@@ -447,10 +502,45 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ═══════════════════════════════════════════════
+#         ALBUM / GROUPED CAPTION RESOLVER
+# ═══════════════════════════════════════════════
+async def resolve_caption(chat_id, msg):
+    """
+    Telegram albums (grouped media) mein sirf ek hi message
+    (usually pehla) caption rakhta hai — baaki sab ka msg.text
+    empty hota hai. Agar current msg ka apna text/caption nahi hai
+    lekin ye kisi group ka hissa hai, to group ke andar dhoondh kar
+    uska original caption nikaalo.
+    """
+    if msg.text:
+        return msg.text
+
+    if not getattr(msg, "grouped_id", None):
+        return msg.text or ""
+
+    # Album ke andar caption dhoondhne ke liye aas paas ke IDs check karo
+    lo = max(msg.id - 9, 1)
+    hi = msg.id + 9
+    try:
+        nearby = await userbot.get_messages(chat_id, ids=list(range(lo, hi + 1)))
+    except Exception as e:
+        logger.warning(f"resolve_caption: nearby fetch failed for MSG ID {msg.id}: {e}")
+        return msg.text or ""
+
+    for m in nearby:
+        if m and getattr(m, "grouped_id", None) == msg.grouped_id and m.text:
+            return m.text
+
+    return msg.text or ""
+
+# ═══════════════════════════════════════════════
 #              RANGE PROCESSOR
 # ═══════════════════════════════════════════════
-async def process_range(update: Update, progress_msg):
+async def process_range(progress_msg):
     global is_running, current_msg_id
+
+    bot = progress_msg.get_bot()
+    notify_chat_id = progress_msg.chat_id
 
     task = await db_get_task()
     if not task:
@@ -517,8 +607,9 @@ async def process_range(update: Update, progress_msg):
                         logger.info(f"MSG ID {msg_id} — skipped (restricted channel)")
                     else:
                         try:
-                            # ✅ Original caption jaisi hai waisi hi bhejo, koi trimming/building nahi
-                            await userbot.send_file(TARGET_CHANNEL, msg.media, caption=msg.text)
+                            # ✅ Original caption jaisi hai waisi hi bhejo (album ka bhi handle hota hai)
+                            caption = await resolve_caption(chat_id, msg)
+                            await userbot.send_file(TARGET_CHANNEL, msg.media, caption=caption)
                             copied += 1
                             logger.info(f"MSG ID {msg_id} — copied (original caption) ✅")
                             await asyncio.sleep(GAP_SECONDS)
@@ -528,7 +619,7 @@ async def process_range(update: Update, progress_msg):
 
             except FloodWaitError as e:
                 logger.warning(f"FloodWait at MSG ID {msg_id} — {e.seconds}s")
-                await safe_send(update, f"⏳ FloodWait: `{e.seconds}s` wait ho raha hai...")
+                await notify(bot, notify_chat_id, f"⏳ FloodWait: `{e.seconds}s` wait ho raha hai...")
                 await asyncio.sleep(e.seconds)
                 msg_id -= 1
                 continue
@@ -596,6 +687,64 @@ async def error_handler(update, context):
         pass
 
 # ═══════════════════════════════════════════════
+#         AUTO-RESUME (bot restart/sleep ke baad)
+# ═══════════════════════════════════════════════
+async def post_init(app):
+    """
+    Application start hone ke turant baad chalta hai (same event loop mein).
+    Agar restart/sleep/redeploy se pehle koi task adhoora reh gaya tha
+    (DB mein abhi bhi maujood hai), to use khud-b-khud resume karo —
+    owner ko dobara /copy_all bharne ki zaroorat nahi.
+    """
+    global copy_task, is_running, ping_task
+
+    # Self-ping loop shuru karo (agar SELF_PING_URL set hai)
+    ping_task = asyncio.create_task(self_ping_loop())
+
+    task = await db_get_task()
+    if not task:
+        return
+    logger.info(
+        f"Auto-resume: pending task mila — {task.get('chat_title')} "
+        f"@ ID {task.get('current_id')} → {task.get('last_id')}"
+    )
+    progress_msg = await notify(
+        app.bot, OWNER_ID,
+        f"🔄 *Bot restart hua hai — task auto-resume ho raha hai*\n\n"
+        f"📺 *Channel:* `{escape_md(task.get('chat_title', 'Unknown'))}`\n"
+        f"📌 *Ruka hua ID:* `{task.get('current_id')}` → `{task.get('last_id')}`\n\n"
+        f"🛑 Rokne ke liye /cancel bhejo"
+    )
+    if progress_msg:
+        copy_task = asyncio.create_task(process_range(progress_msg))
+
+async def post_shutdown(app):
+    """
+    Application band hone se pehle chalta hai (loop close hone se pehle).
+    Chal rahe copy_task ko cleanly cancel karo aur userbot ko disconnect
+    karo — isse restart/sleep ke waqt 'Task was destroyed' jaisi
+    tracebacks nahi aati aur agli baar reconnect bhi saaf hota hai.
+    """
+    global copy_task, ping_task
+    if copy_task and not copy_task.done():
+        copy_task.cancel()
+        try:
+            await copy_task
+        except Exception:
+            pass
+    if ping_task and not ping_task.done():
+        ping_task.cancel()
+        try:
+            await ping_task
+        except Exception:
+            pass
+    try:
+        await userbot.disconnect()
+    except Exception:
+        pass
+    logger.info("Graceful shutdown complete.")
+
+# ═══════════════════════════════════════════════
 #                    MAIN
 # ═══════════════════════════════════════════════
 def main():
@@ -609,7 +758,7 @@ def main():
     loop.run_until_complete(start_userbot())
     loop.run_until_complete(start_health_server())
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("status", cmd_status))
 
