@@ -2,15 +2,16 @@ import os
 import re
 import asyncio
 import logging
+import uuid
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timedelta
 import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, ChatForwardsRestrictedError
+from telethon.errors import FloodWaitError, ChatForwardsRestrictedError, AuthKeyDuplicatedError
 from telegram import Update
 from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import (
@@ -97,6 +98,7 @@ is_running     = False
 current_msg_id = None
 copy_task      = None   # holds the asyncio.Task running process_range
 ping_task      = None   # holds the asyncio.Task running self_ping_loop
+lock_heartbeat_task = None  # holds the asyncio.Task running userbot_lock_heartbeat_loop
 manual_cancel  = False  # True sirf jab /cancel command se cancel hua ho
 
 # ═══════════════════════════════════════════════
@@ -192,6 +194,12 @@ userbot = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db           = mongo_client[MONGO_DB]
 col_task     = db["task"]
+col_lock     = db["userbot_lock"]
+
+INSTANCE_ID          = str(uuid.uuid4())[:8]
+LOCK_STALE_SECONDS   = 45   # itni der heartbeat na aaye to lock "purana/dead" maana jayega
+LOCK_HEARTBEAT_SECS  = 15   # kitni baar lock ko "zinda" hone ka signal bhejna hai
+LOCK_MAX_WAIT_SECS   = 90   # naye instance ka max wait time lock ke liye
 
 # ═══════════════════════════════════════════════
 #            HEALTH CHECK SERVER (Koyeb)
@@ -257,11 +265,85 @@ async def db_clear_task():
     logger.info("MongoDB: task cleared")
 
 # ═══════════════════════════════════════════════
+#         USERBOT SINGLE-INSTANCE LOCK
+# ═══════════════════════════════════════════════
+async def try_acquire_userbot_lock() -> bool:
+    """
+    Ek hi Telethon session (SESSION_STRING) ko agar do instances
+    (jaise redeploy ke dauran purana + naya) EK SAATH connect karne ki
+    koshish karein, to Telegram us session ko AuthKeyDuplicatedError
+    de kar PERMANENTLY revoke kar deta hai (naya session generate
+    karna padta hai). Ye MongoDB-based lock isliye lagaya hai taaki
+    ek waqt par sirf EK hi instance userbot session hold kare.
+    """
+    now = datetime.now()
+    stale_before = now - timedelta(seconds=LOCK_STALE_SECONDS)
+
+    # Pehli baar: lock document create karne ki koshish (agar exist nahi karta)
+    try:
+        await col_lock.insert_one({"_id": "userbot", "holder": INSTANCE_ID, "heartbeat": now})
+        return True
+    except Exception:
+        pass  # Lock document already maujood hai
+
+    # Agar purana lock stale (dead instance ka chhoda hua) hai to use "cheeno"
+    result = await col_lock.find_one_and_update(
+        {"_id": "userbot", "heartbeat": {"$lt": stale_before}},
+        {"$set": {"holder": INSTANCE_ID, "heartbeat": now}}
+    )
+    return result is not None
+
+async def acquire_userbot_lock():
+    waited = 0
+    while waited < LOCK_MAX_WAIT_SECS:
+        if await try_acquire_userbot_lock():
+            logger.info(f"🔒 Userbot lock mil gaya (instance {INSTANCE_ID})")
+            return
+        logger.info(
+            f"🔒 Userbot lock kisi aur instance ke paas hai — wait kar rahe "
+            f"hain ({waited}s/{LOCK_MAX_WAIT_SECS}s)"
+        )
+        await asyncio.sleep(3)
+        waited += 3
+    logger.warning(
+        "🔒 Userbot lock wait timeout ho gaya — aage badh rahe hain "
+        "(risk: agar dusra instance abhi bhi zinda hai to conflict ho sakta hai)"
+    )
+
+async def userbot_lock_heartbeat_loop():
+    """Har LOCK_HEARTBEAT_SECS mein lock ko 'main zinda hu' signal bhejta hai."""
+    while True:
+        await asyncio.sleep(LOCK_HEARTBEAT_SECS)
+        try:
+            await col_lock.update_one(
+                {"_id": "userbot", "holder": INSTANCE_ID},
+                {"$set": {"heartbeat": datetime.now()}}
+            )
+        except Exception as e:
+            logger.warning(f"🔒 Lock heartbeat fail hua: {e}")
+
+async def release_userbot_lock():
+    try:
+        await col_lock.delete_one({"_id": "userbot", "holder": INSTANCE_ID})
+        logger.info("🔒 Userbot lock release kar diya")
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════
 #              USERBOT LOGIN
 # ═══════════════════════════════════════════════
 async def start_userbot():
     logger.info("UserBot connecting via session string...")
-    await userbot.connect()
+    try:
+        await userbot.connect()
+    except AuthKeyDuplicatedError:
+        logger.error(
+            "❌ SESSION_STRING PERMANENTLY REVOKE ho chuki hai "
+            "(AuthKeyDuplicatedError)! Ye session ek saath 2 alag IPs se "
+            "use hui thi. Ab ye session kabhi kaam nahi karegi — naya "
+            "SESSION_STRING generate karke environment variable update karo."
+        )
+        raise SystemExit("SESSION_STRING revoked — naya session generate karna zaroori hai.")
     if not await userbot.is_user_authorized():
         logger.error("❌ SESSION_STRING invalid ya expire ho gayi!")
         raise SystemExit("SESSION_STRING kaam nahi kar rahi.")
@@ -758,10 +840,13 @@ async def post_init(app):
     (DB mein abhi bhi maujood hai), to use khud-b-khud resume karo —
     owner ko dobara /copy_all bharne ki zaroorat nahi.
     """
-    global copy_task, is_running, ping_task
+    global copy_task, is_running, ping_task, lock_heartbeat_task
 
     # Self-ping loop shuru karo (agar SELF_PING_URL set hai)
     ping_task = asyncio.create_task(self_ping_loop())
+
+    # Userbot lock ko "zinda" rakhne ke liye heartbeat shuru karo
+    lock_heartbeat_task = asyncio.create_task(userbot_lock_heartbeat_loop())
 
     task = await db_get_task()
     if not task:
@@ -787,7 +872,7 @@ async def post_shutdown(app):
     karo — isse restart/sleep ke waqt 'Task was destroyed' jaisi
     tracebacks nahi aati aur agli baar reconnect bhi saaf hota hai.
     """
-    global copy_task, ping_task
+    global copy_task, ping_task, lock_heartbeat_task
     if copy_task and not copy_task.done():
         copy_task.cancel()
         try:
@@ -800,6 +885,13 @@ async def post_shutdown(app):
             await ping_task
         except Exception:
             pass
+    if lock_heartbeat_task and not lock_heartbeat_task.done():
+        lock_heartbeat_task.cancel()
+        try:
+            await lock_heartbeat_task
+        except Exception:
+            pass
+    await release_userbot_lock()
     try:
         await userbot.disconnect()
     except Exception:
@@ -816,6 +908,11 @@ def main():
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # Pehle userbot session ka lock lo — taaki agar purana instance
+    # abhi bhi isi SESSION_STRING se connected hai, to overlap na ho
+    # (overlap se session permanently revoke ho sakti hai).
+    loop.run_until_complete(acquire_userbot_lock())
 
     loop.run_until_complete(start_userbot())
     loop.run_until_complete(start_health_server())
