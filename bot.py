@@ -77,7 +77,7 @@ SELF_PING_INTERVAL = int(os.getenv("SELF_PING_INTERVAL", 20 * 60))  # seconds, d
 # ═══════════════════════════════════════════════
 #                  CONSTANTS
 # ═══════════════════════════════════════════════
-GAP_SECONDS = 60
+GAP_SECONDS = 10
 LINK_REGEX  = r"https://t.me/(c/)?([\w\d_]+)/(\d+)"
 
 # Sirf itne se bade files copy honge (MB mein). Railway variable se override
