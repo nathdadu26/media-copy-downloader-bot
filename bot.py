@@ -97,6 +97,7 @@ is_running     = False
 current_msg_id = None
 copy_task      = None   # holds the asyncio.Task running process_range
 ping_task      = None   # holds the asyncio.Task running self_ping_loop
+manual_cancel  = False  # True sirf jab /cancel command se cancel hua ho
 
 # ═══════════════════════════════════════════════
 #         FILE SIZE FILTER
@@ -454,13 +455,14 @@ async def receive_last_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global copy_task, is_running, current_msg_id
+    global copy_task, is_running, current_msg_id, manual_cancel
     if update.effective_user.id != OWNER_ID:
         return ConversationHandler.END
     logger.info(f"/cancel by {update.effective_user.id}")
 
     # Case 1: Background copy task memory mein actively chal raha hai
     if copy_task and not copy_task.done():
+        manual_cancel = True
         copy_task.cancel()
         try:
             await copy_task
@@ -538,7 +540,7 @@ async def resolve_caption(chat_id, msg):
 #              RANGE PROCESSOR
 # ═══════════════════════════════════════════════
 async def process_range(progress_msg):
-    global is_running, current_msg_id
+    global is_running, current_msg_id, manual_cancel
 
     bot = progress_msg.get_bot()
     notify_chat_id = progress_msg.chat_id
@@ -655,17 +657,36 @@ async def process_range(progress_msg):
         )
 
     except asyncio.CancelledError:
-        # /cancel se yahan pahuchte hain — DB ko cancel() function khud clear karega
-        logger.info(f"process_range CANCELLED by user at MSG ID {current_msg_id}")
-        try:
-            await safe_edit(progress_msg,
-                f"🛑 *Task Cancelled*\n\n"
-                f"📺 *Channel:* `{escape_md(task['chat_title'])}`\n"
-                f"📌 *Ruka hua ID:* `{current_msg_id}`\n\n"
-                f"📋 Copied: `{copied}` | ⏭ Skipped: `{skipped}` | ❌ Failed: `{failed}`"
+        if manual_cancel:
+            # /cancel command se yahan pahuchte hain — DB ko cancel() function khud clear karega
+            logger.info(f"process_range CANCELLED by user at MSG ID {current_msg_id}")
+            try:
+                await safe_edit(progress_msg,
+                    f"🛑 *Task Cancelled (by user)*\n\n"
+                    f"📺 *Channel:* `{escape_md(task['chat_title'])}`\n"
+                    f"📌 *Ruka hua ID:* `{current_msg_id}`\n\n"
+                    f"📋 Copied: `{copied}` | ⏭ Skipped: `{skipped}` | ❌ Failed: `{failed}`"
+                )
+            except Exception:
+                pass
+            manual_cancel = False
+        else:
+            # Bot restart/redeploy/shutdown ki wajah se hua — task DB mein
+            # save hai, agla start hote hi khud-b-khud resume ho jayega
+            logger.info(
+                f"process_range interrupted (shutdown/redeploy) at MSG ID "
+                f"{current_msg_id} — DB mein safe hai, auto-resume hoga"
             )
-        except Exception:
-            pass
+            try:
+                await safe_edit(progress_msg,
+                    f"🔄 *Bot restart ho raha hai — task pause hua*\n\n"
+                    f"📺 *Channel:* `{escape_md(task['chat_title'])}`\n"
+                    f"📌 *Ruka hua ID:* `{current_msg_id}`\n\n"
+                    f"📋 Copied: `{copied}` | ⏭ Skipped: `{skipped}` | ❌ Failed: `{failed}`\n\n"
+                    f"✅ Restart complete hote hi khud resume ho jayega."
+                )
+            except Exception:
+                pass
         raise
 
     finally:
