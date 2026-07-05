@@ -12,6 +12,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, ChatForwardsRestrictedError
 from telegram import Update
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -671,12 +672,52 @@ async def process_range(progress_msg):
         is_running = False
 
 # ═══════════════════════════════════════════════
+#         DUPLICATE INSTANCE TAKEOVER
+# ═══════════════════════════════════════════════
+async def force_takeover_polling():
+    """
+    Telegram Bot API mein ek waqt par sirf EK hi getUpdates (long-polling)
+    session allowed hota hai. Agar koi purana bot instance (jaise pichla
+    deployment jo abhi tak fully band nahi hua) already polling kar raha
+    hai, to hum khud ek raw getUpdates call bhej kar uska session turant
+    "kick" kar dete hain — Telegram hamesha sabse latest call ko priority
+    deta hai, isliye purana instance turant Conflict error khaake ruk
+    jaata hai aur humari polling free ho jaati hai.
+
+    Note: Agar 2 instances GENUINELY hamesha saath chal rahe hain (jaise
+    galti se bot do jagah deploy ho gaya), to ye sirf temporary fix hai —
+    dono baar-baar ek dusre ko kick karte rahenge. Asli fix wahan sirf
+    ek hi jagah deploy rakhna hai.
+    """
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json={"offset": -1, "timeout": 0},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                data = await resp.json()
+                logger.info(f"🔧 Takeover request bheja gaya — ok={data.get('ok')}")
+    except Exception as e:
+        logger.warning(f"🔧 Takeover request fail hua: {e}")
+    # Purane instance ko apna conflict handle karne ke liye thoda time do
+    await asyncio.sleep(2)
+
+# ═══════════════════════════════════════════════
 #              GLOBAL ERROR HANDLER
 # ═══════════════════════════════════════════════
 async def error_handler(update, context):
     err = context.error
     logger.error(f"Global error: {err}", exc_info=context.error)
-    from telegram.error import NetworkError, TimedOut
+
+    if isinstance(err, Conflict):
+        logger.warning(
+            "⚠️ Conflict: Dusra bot instance (purana deployment) abhi bhi "
+            "polling kar raha hai. Takeover ki koshish kar rahe hain..."
+        )
+        asyncio.create_task(force_takeover_polling())
+        return
+
     if isinstance(err, (NetworkError, TimedOut)):
         logger.warning(f"Transient network error (ignored): {err}")
         return
@@ -757,6 +798,12 @@ def main():
 
     loop.run_until_complete(start_userbot())
     loop.run_until_complete(start_health_server())
+
+    # Agar koi purana bot instance (pichla deployment) abhi bhi polling
+    # kar raha hai, to use pehle "kick" kar do taaki naya instance
+    # bina Conflict error ke turant polling shuru kar sake.
+    logger.info("🔧 Purana instance (agar chal raha ho) takeover kar rahe hain...")
+    loop.run_until_complete(force_takeover_polling())
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start",  start))
